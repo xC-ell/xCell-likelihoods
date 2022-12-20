@@ -2,7 +2,7 @@ import numpy as np
 from scipy.interpolate import interp1d
 import pyccl as ccl
 import pyccl.nl_pt as pt
-from .hm_extra import HalomodCorrection
+from .hm_extra import HalomodCorrection, HaloProfileCIBM21, IvTracer
 from .pixwin import beam_hpix
 from .lpt import LPTCalculator, get_lpt_pk2d
 from .ept import EPTCalculator, get_ept_pk2d
@@ -56,6 +56,8 @@ class ClLike(Likelihood):
     defaults: dict = {}
     # List of two-point functions that make up the data vector
     twopoints: list = []
+    # SFR Model to use
+    emerge: bool = False
 
     def initialize(self):
         # Read SACC file
@@ -70,7 +72,8 @@ class ClLike(Likelihood):
         self.qabbr = {'galaxy_density': 'g',
                       'galaxy_shear': 'm',
                       'cmb_convergence': 'm',
-                      'cmb_tSZ': 'y'}
+                      'cmb_tSZ': 'y',
+                      'generic': 'm'}
 
         # Pk sampling
         self.a_s_pks = 1./(1+np.linspace(0., self.zmax_pks, self.nz_pks)[::-1])
@@ -136,7 +139,8 @@ class ClLike(Likelihood):
             self.profs = {'galaxy_density': None,
                           'galaxy_shear': ccl.halos.HaloProfileNFW(self.cm),
                           'cmb_convergence': ccl.halos.HaloProfileNFW(self.cm),
-                          'cmb_tSZ': ccl.halos.HaloProfilePressureGNFW()}
+                          'cmb_tSZ': ccl.halos.HaloProfilePressureGNFW(),
+                          'generic': HaloProfileCIBM21(self.cm, emerge=self.emerge)}
             # Profile 2-point function for HOD
             self.p2pt_HOD = ccl.halos.Profile2ptHOD()
             # Halo model correction for the transition regime
@@ -159,7 +163,7 @@ class ClLike(Likelihood):
             cltyp = 'cl_'
             for tr in [tr1, tr2]:
                 q = tr.quantity
-                if (q == 'galaxy_density') or (q == 'cmb_convergence'):
+                if q in ['galaxy_density', 'cmb_convergence', 'cmb_tSZ', 'generic']:
                     cltyp += '0'
                 elif q == 'galaxy_shear':
                     cltyp += 'e'
@@ -186,7 +190,7 @@ class ClLike(Likelihood):
                 raise LoggedError(self.log, "Unknown tracer %s" % b['name'])
             t = s.tracers[b['name']]
             # Default redshift distributions
-            if t.quantity in ['galaxy_density', 'galaxy_shear']:
+            if t.quantity in ['galaxy_density', 'galaxy_shear', 'generic']:
                 zmid = np.average(t.z, weights=t.nz)
                 self.bin_properties[b['name']] = {'z_fid': t.z,
                                                   'nz_fid': t.nz,
@@ -379,6 +383,7 @@ class ClLike(Likelihood):
         current parameters."""
         trs = {}
         is_PT_bias = self.bias_model in ['LagrangianPT', 'EulerianPT']
+        igal = 0
         for name, q in self.tracer_qs.items():
             prefix = self.input_params_prefix + '_' + name
             if self.bias_model == 'HaloModel':
@@ -390,6 +395,8 @@ class ClLike(Likelihood):
                 bz = self._get_bz(cosmo, name, **pars)
                 t = ccl.NumberCountsTracer(cosmo, dndz=nz,
                                            bias=bz, has_rsd=False)
+                quant = f'g{igal}'
+                igal += 1
                 if is_PT_bias:
                     z = self.bin_properties[name]['z_fid']
                     zmean = self.bin_properties[name]['zmean_fid']
@@ -414,17 +421,20 @@ class ClLike(Likelihood):
                     prof = ccl.halos.HaloProfileHOD(self.cm)
                     prof.update_parameters(**hod_pars)
             elif q == 'galaxy_shear':
+                quant = 'm'
                 nz = self._get_nz(cosmo, name, **pars)
                 ia = self._get_ia_bias(cosmo, name, **pars)
                 t = ccl.WeakLensingTracer(cosmo, nz, ia_bias=ia)
                 if is_PT_bias:
                     ptt = pt.PTMatterTracer()
             elif q == 'cmb_convergence':
+                quant = 'm'
                 # B.H. TODO: pass z_source as parameter to the YAML file
                 t = ccl.CMBLensingTracer(cosmo, z_source=1100)
                 if is_PT_bias:
                     ptt = pt.PTMatterTracer()
             elif q == 'cmb_tSZ':
+                quant = 'pe'
                 t = ccl.tSZTracer(cosmo, z_max=3.)
                 if self.bias_model == 'HaloModel':
                     o_m_b = pars.get(self.input_params_prefix +
@@ -434,9 +444,29 @@ class ClLike(Likelihood):
                 else:
                     raise NotImplementedError("Can't do tSZ without"
                                               " the halo model.")
+            elif q == 'generic':
+                quant = 'sfrd'
+                z, snu = self._get_nz(cosmo, name, **pars)
+                t = IvTracer(cosmo, snu, z)
+                if self.bias_model == 'HaloModel':
+                    if self.emerge:
+                        cib_pars = {k: pars[self.input_params_prefix + '_' + k]
+                                    for k in ['log10M0', 'log10Mz',
+                                              'eps0', 'epsz',
+                                              'beta0', 'betaz',
+                                              'gamma0', 'gammaz']}
+                    else:
+                        cib_pars = {k: pars[self.input_params_prefix + '_' + k]
+                                    for k in ['log10meff', 'etamax', 'sigLM0', 'tau']}
+                    prof.update_parameters(**cib_pars)
+                    normed = False
+                else:
+                    raise NotImplementedError("Can't do tSZ without"
+                                              " the halo model.")
 
             trs[name] = {}
             trs[name]['ccl_tracer'] = t
+            trs[name]['quantity_3d'] = quant
             if is_PT_bias:
                 trs[name]['PT_tracer'] = ptt
             if self.bias_model == 'HaloModel':
@@ -490,10 +520,15 @@ class ClLike(Likelihood):
             raise LoggedError(self.log,
                               "Unknown bias model %s" % self.bias_model)
 
-    def _get_pkxy(self, cosmo, clm, pkd, trs, **pars):
+    def _get_pkxy(self, cosmo, clm, pkd, trs, pkdict, **pars):
         """ Get the P(k) between two tracers. """
         q1 = self.tracer_qs[clm['bin_1']]
         q2 = self.tracer_qs[clm['bin_2']]
+        quant1 = trs[clm['bin_1']]['quantity_3d']
+        quant2 = trs[clm['bin_2']]['quantity_3d']
+        pkname = f'pk_{quant1}_{quant2}'
+        if pkname in pkdict:
+            return pkdict[pkname]
 
         if (self.bias_model == 'Linear') or (self.bias_model == 'BzNone'):
             if (q1 == 'galaxy_density') and (q2 == 'galaxy_density'):
@@ -510,6 +545,7 @@ class ClLike(Likelihood):
                 ptt2 = trs[clm['bin_2']]['PT_tracer']
                 pk_pt = get_ept_pk2d(cosmo, ptt1, tracer2=ptt2,
                                      ptc=pkd['ptc'], sub_lowk=False)
+                pkdict[pkname] = pk_pt
                 return pk_pt
         elif (self.bias_model == 'LagrangianPT'):
             if ((q1 != 'galaxy_density') and (q2 != 'galaxy_density')):
@@ -519,6 +555,7 @@ class ClLike(Likelihood):
                 ptt2 = trs[clm['bin_2']]['PT_tracer']
                 pk_pt = get_lpt_pk2d(cosmo, ptt1, tracer2=ptt2,
                                      ptc=pkd['ptc'])
+                pkdict[pkname] = pk_pt
                 return pk_pt
         elif self.bias_model == 'HaloModel':
             k_s = np.logspace(self.l10k_min_pks,
@@ -567,6 +604,7 @@ class ClLike(Likelihood):
                           pk_arr=np.log(pkt),
                           extrap_order_lok=1, extrap_order_hik=2,
                           cosmo=cosmo, is_logp=True)
+            pkdict[pkname] = pk
             return pk
         else:
             raise LoggedError(self.log,
@@ -579,8 +617,9 @@ class ClLike(Likelihood):
 
         # Correlate all needed pairs of tracers
         cls = []
+        pkdict = {}
         for clm in self.cl_meta:
-            pkxy = self._get_pkxy(cosmo, clm, pk, trs, **pars)
+            pkxy = self._get_pkxy(cosmo, clm, pk, trs, pkdict, **pars)
             if self.sample_cen:
                 ls = clm['l_eff']
             elif self.sample_bpw:
@@ -645,8 +684,9 @@ class ClLike(Likelihood):
 
         # Compute all C_ells
         cls = []
+        pkdict = {}
         for clm in self.cl_meta:
-            pkxy = self._get_pkxy(cosmo, clm, pkd, trs, **pars)
+            pkxy = self._get_pkxy(cosmo, clm, pkd, trs, pkdict, **pars)
             ls = self.l_sample
             cl = ccl.angular_cl(cosmo,
                                 trs[clm['bin_1']]['ccl_tracer'],
