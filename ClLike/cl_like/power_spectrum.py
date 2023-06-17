@@ -158,7 +158,8 @@ class Pk(Theory):
         # cosmo.compute_nonlin_power()
         # pkmm = cosmo.get_nonlin_power(name='delta_matter:delta_matter')
         pkmm = None
-        if self.bias_model == 'Linear':
+        if self.bias_model in ['Linear', 'QuasarEvo', 'QuasarEvo1',
+                               'QuasarEvo2', 'QuasarEvo3', 'QuasarEvo4']:
             cosmo.compute_nonlin_power()
             pkmm = cosmo.get_nonlin_power(name='delta_matter:delta_matter')
             if 'delta_matter:Weyl' in cosmo._pk_nl:
